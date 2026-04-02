@@ -19,7 +19,6 @@ const SOLANA_RPC_WSS =
 
 const INITIAL_WATCH_WALLET = process.env.WATCH_WALLET || "";
 const CALL_BURST_WINDOW_MS = Number(process.env.CALL_BURST_WINDOW_MS || 5 * 60 * 1000);
-const CALL_MIN_SOL = Number(process.env.CALL_MIN_SOL || 0.2);
 const PORT = Number(process.env.PORT || 3001);
 
 const ENABLE_CALL =
@@ -61,8 +60,8 @@ let wallets = new Set();
 let subscriptions = new Map(); // wallet -> sub id
 let seenSignatures = new Map(); // wallet -> Map(signature, timestamp)
 
-// burst state (ONLY for call-eligible SOL transfers)
-let lastTxAt = {};   // wallet -> timestamp of latest eligible tx
+// burst state
+let lastTxAt = {};   // wallet -> timestamp of latest tx
 let lastCallAt = {}; // wallet -> timestamp of latest call
 
 // ================= HELPERS =================
@@ -139,21 +138,18 @@ function markSeenSignature(wallet, signature) {
   m.set(signature, Date.now());
 }
 
-// NOTE:
-// This burst logic is now used ONLY for eligible SOL-transfer calls.
-// Token tx / swaps / buys / sells will NOT update burst state anymore.
 function shouldCallForBurst(wallet, now = Date.now()) {
   const prevTxAt = Number(lastTxAt[wallet] || 0);
 
-  // update latest eligible tx time first
+  // update latest tx time first
   lastTxAt[wallet] = now;
 
-  // first eligible tx ever seen
+  // tx đầu tiên từng thấy
   if (!prevTxAt) {
     return true;
   }
 
-  // if silent for > burst window => new burst => call once again
+  // nếu đã im lặng quá 5 phút => burst mới => gọi lại 1 lần
   return now - prevTxAt > CALL_BURST_WINDOW_MS;
 }
 
@@ -305,99 +301,6 @@ async function getParsedTx(signature) {
   }
 }
 
-function getAllInstructions(parsedTx) {
-  const outer = parsedTx?.transaction?.message?.instructions || [];
-  const inner =
-    (parsedTx?.meta?.innerInstructions || []).flatMap((x) => x.instructions || []);
-  return [...outer, ...inner];
-}
-
-function normalizeProgramName(ix) {
-  return String(ix?.program || ix?.programId || "").toLowerCase();
-}
-
-function isTokenProgramInstruction(ix) {
-  const program = normalizeProgramName(ix);
-  const parsedType = String(ix?.parsed?.type || "").toLowerCase();
-
-  if (
-    program.includes("spl-token") ||
-    program.includes("tokenkeg") ||
-    program.includes("token-2022") ||
-    program.includes("associated token")
-  ) {
-    return true;
-  }
-
-  const tokenTypes = new Set([
-    "transferchecked",
-    "mintto",
-    "minttochecked",
-    "burn",
-    "burnchecked",
-    "approve",
-    "approvechecked",
-    "revoke",
-    "closeaccount",
-    "initializeaccount",
-    "initializeaccount2",
-    "initializeaccount3",
-    "syncnative",
-    "thawaccount",
-    "freezeaccount",
-    "setauthority",
-  ]);
-
-  return tokenTypes.has(parsedType);
-}
-
-function isNativeSolTransferInstructionForWallet(ix, wallet) {
-  const program = normalizeProgramName(ix);
-  const parsedType = String(ix?.parsed?.type || "").toLowerCase();
-  const info = ix?.parsed?.info || {};
-
-  const isSystemTransfer =
-    program === "system" &&
-    (parsedType === "transfer" || parsedType === "transferwithseed");
-
-  if (!isSystemTransfer) return false;
-
-  const source = String(info.source || info.from || "");
-  const destination = String(info.destination || info.to || "");
-  const lamports = Number(info.lamports || 0);
-
-  if (!lamports || lamports <= 0) return false;
-
-  return source === wallet || destination === wallet;
-}
-
-function hasTokenBalanceChange(parsedTx) {
-  const pre = parsedTx?.meta?.preTokenBalances || [];
-  const post = parsedTx?.meta?.postTokenBalances || [];
-  return pre.length > 0 || post.length > 0;
-}
-
-function isPureSolTransferForWallet(parsedTx, wallet) {
-  if (!parsedTx?.meta || parsedTx.meta.err) return false;
-
-  const allIxs = getAllInstructions(parsedTx);
-
-  // must contain an actual native SOL transfer for this wallet
-  const hasNativeSolTransfer = allIxs.some((ix) =>
-    isNativeSolTransferInstructionForWallet(ix, wallet)
-  );
-  if (!hasNativeSolTransfer) return false;
-
-  // reject anything involving SPL tokens / ATA / sync native / swap token legs
-  const hasTokenIx = allIxs.some((ix) => isTokenProgramInstruction(ix));
-  if (hasTokenIx) return false;
-
-  // reject any tx that changed token balances
-  if (hasTokenBalanceChange(parsedTx)) return false;
-
-  return true;
-}
-
 function inferWalletSolDelta(parsedTx, wallet) {
   try {
     const tx = parsedTx?.transaction;
@@ -475,6 +378,10 @@ async function handleWalletLog(wallet, logInfo, ctxInfo = {}) {
     if (hasSeenSignature(wallet, signature)) return;
     markSeenSignature(wallet, signature);
 
+    const now = Date.now();
+    const isNewBurst = shouldCallForBurst(wallet, now);
+    saveState();
+
     const parsedTx = await getParsedTx(signature);
     const solDelta = inferWalletSolDelta(parsedTx, wallet);
     const direction = inferDirection(solDelta);
@@ -487,51 +394,19 @@ async function handleWalletLog(wallet, logInfo, ctxInfo = {}) {
       err,
     });
 
-    // Telegram vẫn gửi cho mọi activity
+    // Telegram luôn gửi
     await sendTelegram(msg);
 
-    // ===== CALL FILTER =====
-    // Call only when:
-    // 1) pure native SOL transfer
-    // 2) abs(solDelta) > CALL_MIN_SOL
-    const isPureSolTransfer = isPureSolTransferForWallet(parsedTx, wallet);
-    const absSolDelta =
-      typeof solDelta === "number" ? Math.abs(solDelta) : null;
-    const meetsMinSol =
-      typeof absSolDelta === "number" && absSolDelta > CALL_MIN_SOL;
-
-    if (!isPureSolTransfer) {
-      log(`⛔ Skip call (not pure SOL transfer) for ${wallet} sig=${signature}`);
-      log(`✅ Telegram alert sent for ${wallet} sig=${signature}`);
-      return;
-    }
-
-    if (!meetsMinSol) {
-      log(
-        `⛔ Skip call (SOL delta <= ${CALL_MIN_SOL}) for ${wallet} sig=${signature} delta=${solDelta}`
-      );
-      log(`✅ Telegram alert sent for ${wallet} sig=${signature}`);
-      return;
-    }
-
-    // Only eligible SOL transfers affect burst logic
-    const now = Date.now();
-    const isNewBurst = shouldCallForBurst(wallet, now);
-    saveState();
-
+    // Chỉ gọi 1 lần ở đầu mỗi burst
     if (isNewBurst) {
       await makePhoneCall({
         wallet,
         direction,
         solDelta,
       });
-      log(
-        `📞 SOL-transfer burst call sent for ${wallet} sig=${signature} delta=${solDelta}`
-      );
+      log(`📞 Burst call sent for ${wallet} sig=${signature}`);
     } else {
-      log(
-        `⏭ SOL-transfer burst already active, skip call for ${wallet} sig=${signature} delta=${solDelta}`
-      );
+      log(`⏭ Burst already active, skip call for ${wallet} sig=${signature}`);
     }
 
     log(`✅ Telegram alert sent for ${wallet} sig=${signature}`);
@@ -620,7 +495,6 @@ bot.command("status", async (ctx) => {
       `🔌 Active subscriptions: ${subscriptions.size}`,
       `📞 Calls: ${ENABLE_CALL ? "ON" : "OFF"}`,
       `⏱ Burst window: ${Math.floor(CALL_BURST_WINDOW_MS / 1000)} giây`,
-      `📉 Call min SOL: ${CALL_MIN_SOL}`,
       `📱 Target phones: ${
         YOUR_PHONE_NUMBERS.length ? YOUR_PHONE_NUMBERS.join(", ") : "(missing)"
       }`,
@@ -718,7 +592,7 @@ bot.command("testalert", async (ctx) => {
   const msg = buildAlertMessage({
     wallet,
     signature: "TEST_SIGNATURE_123",
-    solDelta: -0.234567,
+    solDelta: -0.123456,
     slot: 999999999,
     err: null,
   });
@@ -728,7 +602,7 @@ bot.command("testalert", async (ctx) => {
   const result = await makePhoneCall({
     wallet,
     direction: "Outgoing transfer detected",
-    solDelta: -0.234567,
+    solDelta: -0.123456,
   });
 
   if (result.ok) {
@@ -771,7 +645,6 @@ const server = http.createServer((req, res) => {
       walletCount: wallets.size,
       subscriptionCount: subscriptions.size,
       wallets: [...wallets],
-      callMinSol: CALL_MIN_SOL,
       now: new Date().toISOString(),
     });
 
