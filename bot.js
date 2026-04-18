@@ -18,10 +18,13 @@ const SOLANA_RPC_WSS =
   process.env.SOLANA_RPC_WSS || "wss://api.mainnet-beta.solana.com";
 
 const INITIAL_WATCH_WALLET = process.env.WATCH_WALLET || "";
-const CALL_BURST_WINDOW_MS = Number(process.env.CALL_BURST_WINDOW_MS || 5 * 60 * 1000);
+const CALL_BURST_WINDOW_MS = Number(
+  process.env.CALL_BURST_WINDOW_MS || 5 * 60 * 1000
+);
 const PORT = Number(process.env.PORT || 3001);
+const TELEGRAM_ALERT_MIN_SOL = Number(process.env.TELEGRAM_ALERT_MIN_SOL || 0.001);
 
-const ENABLE_CALL =
+let ENABLE_CALL =
   String(process.env.ENABLE_CALL || "false").toLowerCase() === "true";
 
 const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID || "";
@@ -51,7 +54,7 @@ const connection = new Connection(SOLANA_RPC_HTTP, {
 });
 
 const twilioClient =
-  ENABLE_CALL && TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN
+  TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN
     ? twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
     : null;
 
@@ -59,9 +62,10 @@ let isEnabled = true;
 let wallets = new Set();
 let subscriptions = new Map(); // wallet -> sub id
 let seenSignatures = new Map(); // wallet -> Map(signature, timestamp)
+let lastPinnedMessageId = null;
 
 // burst state
-let lastTxAt = {};   // wallet -> timestamp of latest tx
+let lastTxAt = {}; // wallet -> timestamp of latest tx
 let lastCallAt = {}; // wallet -> timestamp of latest call
 
 // ================= HELPERS =================
@@ -105,8 +109,30 @@ function truncate(text, max = 1000) {
   return s.length > max ? s.slice(0, max) + "..." : s;
 }
 
-function escapeMarkdown(text) {
-  return String(text).replace(/([_*\[\]()~`>#+\-=|{}.!\\])/g, "\\$1");
+function escapeHtml(text) {
+  return String(text || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+function shortAddress(address, left = 4, right = 4) {
+  const s = String(address || "");
+  if (s.length <= left + right + 3) return s;
+  return `${s.slice(0, left)}...${s.slice(-right)}`;
+}
+
+function solscanTxLink(signature) {
+  return `https://solscan.io/tx/${signature}`;
+}
+
+function solscanAddressLink(address) {
+  return `https://solscan.io/account/${address}`;
+}
+
+function htmlLink(url, label) {
+  return `<a href="${escapeHtml(url)}">${escapeHtml(label)}</a>`;
 }
 
 function ensureSeenMap(wallet) {
@@ -140,16 +166,12 @@ function markSeenSignature(wallet, signature) {
 
 function shouldCallForBurst(wallet, now = Date.now()) {
   const prevTxAt = Number(lastTxAt[wallet] || 0);
-
-  // update latest tx time first
   lastTxAt[wallet] = now;
 
-  // tx đầu tiên từng thấy
   if (!prevTxAt) {
     return true;
   }
 
-  // nếu đã im lặng quá 5 phút => burst mới => gọi lại 1 lần
   return now - prevTxAt > CALL_BURST_WINDOW_MS;
 }
 
@@ -161,9 +183,11 @@ function saveState() {
   try {
     const data = {
       isEnabled,
+      enableCall: ENABLE_CALL,
       wallets: [...wallets],
       lastTxAt,
       lastCallAt,
+      lastPinnedMessageId,
       updatedAt: new Date().toISOString(),
     };
     fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2), "utf8");
@@ -179,15 +203,25 @@ function loadState() {
       const data = JSON.parse(raw);
 
       isEnabled = typeof data.isEnabled === "boolean" ? data.isEnabled : true;
+
+      if (typeof data.enableCall === "boolean") {
+        ENABLE_CALL = data.enableCall;
+      }
+
       wallets = new Set(
         Array.isArray(data.wallets)
           ? data.wallets.map((x) => String(x).trim()).filter(Boolean)
           : []
       );
+
       lastTxAt =
         data.lastTxAt && typeof data.lastTxAt === "object" ? data.lastTxAt : {};
       lastCallAt =
-        data.lastCallAt && typeof data.lastCallAt === "object" ? data.lastCallAt : {};
+        data.lastCallAt && typeof data.lastCallAt === "object"
+          ? data.lastCallAt
+          : {};
+      lastPinnedMessageId =
+        typeof data.lastPinnedMessageId === "number" ? data.lastPinnedMessageId : null;
     }
 
     if (INITIAL_WATCH_WALLET) {
@@ -198,30 +232,74 @@ function loadState() {
   } catch (err) {
     console.error("loadState error:", err.message);
     isEnabled = true;
+    ENABLE_CALL =
+      String(process.env.ENABLE_CALL || "false").toLowerCase() === "true";
     wallets = new Set(INITIAL_WATCH_WALLET ? [INITIAL_WATCH_WALLET.trim()] : []);
     lastTxAt = {};
     lastCallAt = {};
+    lastPinnedMessageId = null;
     saveState();
   }
 }
 
-async function sendTelegram(text) {
+async function sendTelegram(text, extra = {}) {
   if (!CHAT_ID) {
     log("⚠️ Missing CHAT_ID, skip telegram");
-    return;
+    return null;
   }
 
   try {
-    await bot.telegram.sendMessage(CHAT_ID, text, {
-      parse_mode: "Markdown",
+    const msg = await bot.telegram.sendMessage(CHAT_ID, text, {
+      parse_mode: "HTML",
       disable_web_page_preview: true,
+      ...extra,
     });
+    return msg;
   } catch (err) {
     console.error(
       "sendTelegram error:",
       err?.response?.description || err.message
     );
+    return null;
   }
+}
+
+async function pinTelegramMessage(messageId) {
+  if (!CHAT_ID || !messageId) return false;
+
+  try {
+    if (lastPinnedMessageId && lastPinnedMessageId !== messageId) {
+      try {
+        await bot.telegram.unpinChatMessage(CHAT_ID, lastPinnedMessageId);
+      } catch (err) {
+        log("unpin old message skipped:", err?.response?.description || err.message);
+      }
+    }
+
+    await bot.telegram.pinChatMessage(CHAT_ID, messageId, {
+      disable_notification: true,
+    });
+
+    lastPinnedMessageId = messageId;
+    saveState();
+    return true;
+  } catch (err) {
+    console.error(
+      "pinTelegramMessage error:",
+      err?.response?.description || err.message
+    );
+    return false;
+  }
+}
+
+async function sendAndPinTelegram(text) {
+  const sent = await sendTelegram(text);
+  if (!sent?.message_id) {
+    return { ok: false, sent: null, pinned: false };
+  }
+
+  const pinned = await pinTelegramMessage(sent.message_id);
+  return { ok: true, sent, pinned };
 }
 
 async function placeSingleCall(to, twiml) {
@@ -256,7 +334,7 @@ async function makePhoneCall({ wallet, direction, solDelta }) {
 
   const sayDelta =
     typeof solDelta === "number"
-      ? `Estimated ${Math.abs(solDelta).toFixed(4)} sol.`
+      ? `Estimated ${Math.abs(solDelta).toFixed(6)} sol.`
       : "A transaction was detected.";
 
   const text = `Alert. Wallet activity detected. ${direction}. ${sayDelta} Check Telegram for details.`;
@@ -346,23 +424,168 @@ function inferDirection(solDelta) {
   return "Wallet activity detected";
 }
 
-function buildAlertMessage({ wallet, signature, solDelta, slot, err }) {
-  const direction = inferDirection(solDelta);
+function inferNativeSolTransfer(parsedTx, watchedWallet) {
+  try {
+    const tx = parsedTx?.transaction;
+    const meta = parsedTx?.meta;
+    if (!tx || !meta) return null;
 
-  return [
-    "🚨 *Real-time wallet alert*",
-    `*Wallet:* \`${wallet}\``,
-    `*Direction:* ${escapeMarkdown(direction)}`,
-    typeof solDelta === "number"
-      ? `*Est\\. SOL delta:* \`${solDelta.toFixed(6)}\``
-      : "",
-    signature ? `*Signature:* \`${signature}\`` : "",
-    typeof slot === "number" ? `*Slot:* \`${slot}\`` : "",
-    err ? "*Status:* failed" : "*Status:* confirmed",
-    `*Time:* ${escapeMarkdown(formatTimeVN())}`,
+    const instructions = tx.message.instructions || [];
+
+    const systemTransfers = instructions.filter((ix) => {
+      return (
+        ix?.parsed?.type === "transfer" &&
+        ix?.program === "system" &&
+        ix?.parsed?.info?.source &&
+        ix?.parsed?.info?.destination &&
+        typeof ix?.parsed?.info?.lamports === "number"
+      );
+    });
+
+    if (!systemTransfers.length) return null;
+
+    const picked =
+      systemTransfers.find((ix) => {
+        const info = ix.parsed.info;
+        return (
+          info.source === watchedWallet || info.destination === watchedWallet
+        );
+      }) || systemTransfers[0];
+
+    const info = picked.parsed.info;
+    const source = info.source;
+    const destination = info.destination;
+    const amountSol = info.lamports / LAMPORTS_PER_SOL;
+
+    return {
+      source,
+      destination,
+      amountSol,
+      isOutgoing: source === watchedWallet,
+      isIncoming: destination === watchedWallet,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function buildAlertMessage({ wallet, signature, solDelta, slot, err, parsedTx }) {
+  const transfer = inferNativeSolTransfer(parsedTx, wallet);
+
+  const title = transfer?.isIncoming
+    ? "🟢 <b>SOL Received</b>"
+    : transfer?.isOutgoing
+    ? "🔴 <b>SOL Sent</b>"
+    : "🚨 <b>Wallet Alert</b>";
+
+  const walletShort = shortAddress(wallet);
+  const walletLink = htmlLink(solscanAddressLink(wallet), walletShort);
+  const signatureLink = signature
+    ? htmlLink(solscanTxLink(signature), "Signature")
+    : "";
+
+  let summary = "";
+  let extra = "";
+
+  if (transfer) {
+    const fromLink = htmlLink(
+      solscanAddressLink(transfer.source),
+      shortAddress(transfer.source)
+    );
+    const toLink = htmlLink(
+      solscanAddressLink(transfer.destination),
+      shortAddress(transfer.destination)
+    );
+
+    summary = `💸 ${fromLink} transferred <b>${transfer.amountSol.toFixed(
+      4
+    )} SOL</b> to ${toLink}`;
+
+    extra = `👀 Watched wallet: ${walletLink}`;
+  } else {
+    const direction = inferDirection(solDelta);
+    summary = `👀 ${walletLink} — ${escapeHtml(direction)}`;
+
+    if (typeof solDelta === "number") {
+      extra = `Δ <b>${solDelta.toFixed(6)} SOL</b>`;
+    }
+  }
+
+  const meta = [
+    signatureLink ? `🔗 ${signatureLink}` : "",
+    typeof slot === "number" ? `🧱 Slot: <code>${slot}</code>` : "",
+    err ? `❌ Status: <b>failed</b>` : `✅ Status: <b>confirmed</b>`,
+    `🕒 ${escapeHtml(formatTimeVN())}`,
   ]
     .filter(Boolean)
     .join("\n");
+
+  return [title, "", summary, extra, "", meta].filter(Boolean).join("\n");
+}
+
+function buildCallReasonMessage({
+  wallet,
+  signature,
+  solDelta,
+  slot,
+  direction,
+  parsedTx,
+}) {
+  const transfer = inferNativeSolTransfer(parsedTx, wallet);
+  const walletLink = htmlLink(solscanAddressLink(wallet), shortAddress(wallet));
+  const signatureLink = signature
+    ? htmlLink(solscanTxLink(signature), "Signature")
+    : "N/A";
+
+  let why = "";
+  if (transfer) {
+    const fromLink = htmlLink(
+      solscanAddressLink(transfer.source),
+      shortAddress(transfer.source)
+    );
+    const toLink = htmlLink(
+      solscanAddressLink(transfer.destination),
+      shortAddress(transfer.destination)
+    );
+
+    why = `Detected transfer: ${fromLink} transferred <b>${transfer.amountSol.toFixed(
+      4
+    )} SOL</b> to ${toLink}`;
+  } else if (typeof solDelta === "number") {
+    why = `Detected SOL delta change on watched wallet: <b>${solDelta.toFixed(
+      6
+    )} SOL</b>`;
+  } else {
+    why = `Detected a new transaction involving watched wallet`;
+  }
+
+  return [
+    "📞 <b>CALL TRIGGERED</b>",
+    "",
+    `🕒 Time: <b>${escapeHtml(formatTimeVN())}</b>`,
+    `👛 Wallet: ${walletLink}`,
+    `📈 Direction: <b>${escapeHtml(direction)}</b>`,
+    typeof solDelta === "number"
+      ? `💰 SOL delta: <b>${solDelta.toFixed(6)}</b>`
+      : "💰 SOL delta: <b>N/A</b>",
+    typeof slot === "number" ? `🧱 Slot: <code>${slot}</code>` : "",
+    `🔗 ${signatureLink}`,
+    "",
+    `📝 Reason: ${why}`,
+    `✅ Burst rule matched: first tx after cooldown window`,
+    `✅ Call is allowed even for tiny delta changes`,
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
+
+function shouldSendTelegramAlert(solDelta) {
+  if (typeof solDelta !== "number") return true;
+  return Math.abs(solDelta) >= TELEGRAM_ALERT_MIN_SOL;
+}
+
+function shouldTriggerCall({ isNewBurst }) {
+  return ENABLE_CALL && isNewBurst;
 }
 
 // ================= SUBSCRIPTIONS =================
@@ -386,30 +609,73 @@ async function handleWalletLog(wallet, logInfo, ctxInfo = {}) {
     const solDelta = inferWalletSolDelta(parsedTx, wallet);
     const direction = inferDirection(solDelta);
 
-    const msg = buildAlertMessage({
-      wallet,
-      signature,
-      solDelta,
-      slot,
-      err,
-    });
+    if (shouldSendTelegramAlert(solDelta)) {
+      const msg = buildAlertMessage({
+        wallet,
+        signature,
+        solDelta,
+        slot,
+        err,
+        parsedTx,
+      });
+      await sendTelegram(msg);
+    } else {
+      log(
+        `🔕 Telegram alert hidden for ${wallet} sig=${signature} because abs(solDelta) < ${TELEGRAM_ALERT_MIN_SOL}`
+      );
+    }
 
-    // Telegram luôn gửi
-    await sendTelegram(msg);
-
-    // Chỉ gọi 1 lần ở đầu mỗi burst
-    if (isNewBurst) {
-      await makePhoneCall({
+    if (shouldTriggerCall({ isNewBurst })) {
+      const callResult = await makePhoneCall({
         wallet,
         direction,
         solDelta,
       });
-      log(`📞 Burst call sent for ${wallet} sig=${signature}`);
+
+      if (callResult.ok) {
+        const callReasonText = buildCallReasonMessage({
+          wallet,
+          signature,
+          solDelta,
+          slot,
+          direction,
+          parsedTx,
+        });
+
+        const pinResult = await sendAndPinTelegram(callReasonText);
+
+        if (!pinResult.pinned) {
+          log(`⚠️ Call detail message sent but pin failed for ${wallet}`);
+        }
+
+        log(`📞 Burst call sent for ${wallet} sig=${signature}`);
+      } else {
+        const failMsg = [
+          "📵 <b>CALL FAILED</b>",
+          "",
+          `🕒 Time: <b>${escapeHtml(formatTimeVN())}</b>`,
+          `👛 Wallet: ${htmlLink(solscanAddressLink(wallet), shortAddress(wallet))}`,
+          typeof solDelta === "number"
+            ? `💰 SOL delta: <b>${solDelta.toFixed(6)}</b>`
+            : "",
+          signature
+            ? `🔗 ${htmlLink(solscanTxLink(signature), "Signature")}`
+            : "",
+          "",
+          `Reason: ${escapeHtml(callResult.reason || "unknown error")}`,
+        ]
+          .filter(Boolean)
+          .join("\n");
+
+        await sendTelegram(failMsg);
+        log(`❌ Call failed for ${wallet} sig=${signature}: ${callResult.reason}`);
+      }
     } else {
-      log(`⏭ Burst already active, skip call for ${wallet} sig=${signature}`);
+      const reason = !ENABLE_CALL ? "calls disabled" : "burst active";
+      log(`⏭ Skip call for ${wallet} sig=${signature} (${reason})`);
     }
 
-    log(`✅ Telegram alert sent for ${wallet} sig=${signature}`);
+    log(`✅ Processing done for ${wallet} sig=${signature}`);
   } catch (err) {
     console.error(`handleWalletLog error for ${wallet}:`, err.message);
   }
@@ -461,6 +727,26 @@ async function resubscribeAll() {
   }
 }
 
+async function registerTelegramCommands() {
+  try {
+    await bot.telegram.setMyCommands([
+      { command: "on", description: "Bật alert" },
+      { command: "off", description: "Tắt alert" },
+      { command: "callon", description: "Bật gọi điện" },
+      { command: "calloff", description: "Tắt gọi điện" },
+      { command: "addwallet", description: "Thêm wallet theo dõi" },
+      { command: "removewallet", description: "Xóa wallet theo dõi" },
+      { command: "list", description: "Xem danh sách wallet" },
+      { command: "status", description: "Xem trạng thái bot" },
+      { command: "testalert", description: "Gửi alert test" },
+      { command: "ping", description: "Kiểm tra bot còn sống" },
+    ]);
+    log("✅ Telegram command menu registered");
+  } catch (err) {
+    console.error("setMyCommands error:", err.message);
+  }
+}
+
 // ================= TELEGRAM COMMANDS =================
 bot.start(async (ctx) => {
   if (!requireAdmin(ctx)) return;
@@ -470,6 +756,8 @@ bot.start(async (ctx) => {
       "",
       "/on",
       "/off",
+      "/callon",
+      "/calloff",
       "/addwallet <address>",
       "/removewallet <address>",
       "/list",
@@ -491,9 +779,10 @@ bot.command("status", async (ctx) => {
   await ctx.reply(
     [
       `⚙️ Status: ${isEnabled ? "ON" : "OFF"}`,
+      `📞 Calls: ${ENABLE_CALL ? "ON" : "OFF"}`,
+      `🔕 Telegram hide under: ${TELEGRAM_ALERT_MIN_SOL} SOL`,
       `👀 Wallet count: ${wallets.size}`,
       `🔌 Active subscriptions: ${subscriptions.size}`,
-      `📞 Calls: ${ENABLE_CALL ? "ON" : "OFF"}`,
       `⏱ Burst window: ${Math.floor(CALL_BURST_WINDOW_MS / 1000)} giây`,
       `📱 Target phones: ${
         YOUR_PHONE_NUMBERS.length ? YOUR_PHONE_NUMBERS.join(", ") : "(missing)"
@@ -519,6 +808,24 @@ bot.command("off", async (ctx) => {
   await ctx.reply("⛔ Alert OFF");
 });
 
+bot.command("calloff", async (ctx) => {
+  if (!requireAdmin(ctx)) return;
+
+  ENABLE_CALL = false;
+  saveState();
+
+  await ctx.reply("📞 Call OFF");
+});
+
+bot.command("callon", async (ctx) => {
+  if (!requireAdmin(ctx)) return;
+
+  ENABLE_CALL = true;
+  saveState();
+
+  await ctx.reply("📞 Call ON");
+});
+
 bot.command("addwallet", async (ctx) => {
   if (!requireAdmin(ctx)) return;
 
@@ -539,8 +846,8 @@ bot.command("addwallet", async (ctx) => {
   saveState();
   await subscribeWallet(wallet);
 
-  await ctx.reply(`✅ Added wallet:\n\`${wallet}\``, {
-    parse_mode: "Markdown",
+  await ctx.reply(`✅ Added wallet:\n<code>${escapeHtml(wallet)}</code>`, {
+    parse_mode: "HTML",
   });
 });
 
@@ -562,8 +869,8 @@ bot.command("removewallet", async (ctx) => {
   await unsubscribeWallet(wallet);
 
   if (existed) {
-    await ctx.reply(`🗑 Removed wallet:\n\`${wallet}\``, {
-      parse_mode: "Markdown",
+    await ctx.reply(`🗑 Removed wallet:\n<code>${escapeHtml(wallet)}</code>`, {
+      parse_mode: "HTML",
     });
   } else {
     await ctx.reply("❌ Wallet không tồn tại.");
@@ -580,29 +887,47 @@ bot.command("list", async (ctx) => {
   }
 
   await ctx.reply(
-    `📌 Wallets đang watch:\n${list.map((w, i) => `${i + 1}. \`${w}\``).join("\n")}`,
-    { parse_mode: "Markdown" }
+    `📌 Wallets đang watch:\n${list
+      .map((w, i) => `${i + 1}. <code>${escapeHtml(w)}</code>`)
+      .join("\n")}`,
+    { parse_mode: "HTML" }
   );
 });
 
 bot.command("testalert", async (ctx) => {
   if (!requireAdmin(ctx)) return;
 
-  const wallet = [...wallets][0] || INITIAL_WATCH_WALLET || "test-wallet";
+  const wallet =
+    [...wallets][0] || INITIAL_WATCH_WALLET || "11111111111111111111111111111111";
+
   const msg = buildAlertMessage({
     wallet,
-    signature: "TEST_SIGNATURE_123",
-    solDelta: -0.123456,
+    signature: "5Qx1TESTabc123signatureXYZ",
+    solDelta: -0.223456,
     slot: 999999999,
     err: null,
+    parsedTx: null,
   });
 
   await sendTelegram(msg);
 
+  if (ENABLE_CALL) {
+    const callInfoMsg = buildCallReasonMessage({
+      wallet,
+      signature: "5Qx1TESTabc123signatureXYZ",
+      solDelta: -0.223456,
+      slot: 999999999,
+      direction: "Outgoing transfer detected",
+      parsedTx: null,
+    });
+
+    await sendAndPinTelegram(callInfoMsg);
+  }
+
   const result = await makePhoneCall({
     wallet,
     direction: "Outgoing transfer detected",
-    solDelta: -0.123456,
+    solDelta: -0.223456,
   });
 
   if (result.ok) {
@@ -642,6 +967,8 @@ const server = http.createServer((req, res) => {
     const body = JSON.stringify({
       ok: true,
       enabled: isEnabled,
+      enableCall: ENABLE_CALL,
+      telegramAlertMinSol: TELEGRAM_ALERT_MIN_SOL,
       walletCount: wallets.size,
       subscriptionCount: subscriptions.size,
       wallets: [...wallets],
@@ -671,6 +998,18 @@ async function start() {
 
   try {
     await bot.launch();
+await bot.telegram.setMyCommands([
+  { command: "on", description: "Bật alert" },
+  { command: "off", description: "Tắt alert" },
+  { command: "callon", description: "Bật gọi điện" },
+  { command: "calloff", description: "Tắt gọi điện" },
+  { command: "addwallet", description: "Thêm wallet" },
+  { command: "removewallet", description: "Xóa wallet" },
+  { command: "list", description: "Danh sách wallet" },
+  { command: "status", description: "Xem trạng thái bot" },
+  { command: "testalert", description: "Test alert + call" },
+  { command: "ping", description: "Check bot sống" },
+]);
     log("🤖 Telegram bot started");
   } catch (err) {
     console.error("❌ Telegram bot failed to start:", err.message);
