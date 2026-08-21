@@ -3,6 +3,7 @@ require("dotenv").config();
 const { Telegraf } = require("telegraf");
 const { Connection, PublicKey, LAMPORTS_PER_SOL } = require("@solana/web3.js");
 const twilio = require("twilio");
+const axios = require("axios");
 const fs = require("fs");
 const path = require("path");
 const http = require("http");
@@ -23,6 +24,32 @@ const CALL_BURST_WINDOW_MS = Number(
 );
 const PORT = Number(process.env.PORT || 3001);
 const TELEGRAM_ALERT_MIN_SOL = Number(process.env.TELEGRAM_ALERT_MIN_SOL || 0.001);
+
+// USD price feed (used by /min threshold)
+const SOL_PRICE_API_URL =
+  process.env.SOL_PRICE_API_URL ||
+  "https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd";
+const SOL_PRICE_CACHE_MS = Number(process.env.SOL_PRICE_CACHE_MS || 30 * 1000);
+
+// Known SPL token mints treated as ~1 USD per token (stablecoins).
+// Add more via KNOWN_TOKEN_MINTS env: "mint1:SYMBOL:usdPerToken,mint2:SYMBOL:usdPerToken"
+const KNOWN_TOKENS = {
+  Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB: { symbol: "USDT", usdPerToken: 1 },
+  EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v: { symbol: "USDC", usdPerToken: 1 },
+};
+
+if (process.env.KNOWN_TOKEN_MINTS) {
+  for (const entry of process.env.KNOWN_TOKEN_MINTS.split(",")) {
+    const [mint, symbol, usdPerToken] = entry.split(":").map((x) => x?.trim());
+    if (mint && symbol) {
+      KNOWN_TOKENS[mint] = { symbol, usdPerToken: Number(usdPerToken) || 1 };
+    }
+  }
+}
+
+function getTokenInfo(mint) {
+  return KNOWN_TOKENS[mint] || null;
+}
 
 let ENABLE_CALL =
   String(process.env.ENABLE_CALL || "false").toLowerCase() === "true";
@@ -67,6 +94,13 @@ let lastPinnedMessageId = null;
 // burst state
 let lastTxAt = {}; // wallet -> timestamp of latest tx
 let lastCallAt = {}; // wallet -> timestamp of latest call
+
+// /min feature: wallet -> minimum USD tx value required to trigger a call
+let walletMinUsd = {};
+
+// SOL/USD price cache
+let cachedSolPriceUsd = null;
+let cachedSolPriceAt = 0;
 
 // ================= HELPERS =================
 function log(...args) {
@@ -164,6 +198,43 @@ function markSeenSignature(wallet, signature) {
   m.set(signature, Date.now());
 }
 
+function getWalletMinUsd(wallet) {
+  const v = Number(walletMinUsd[wallet]);
+  return Number.isFinite(v) && v > 0 ? v : 0;
+}
+
+function setWalletMinUsd(wallet, amountUsd) {
+  if (amountUsd > 0) {
+    walletMinUsd[wallet] = amountUsd;
+  } else {
+    delete walletMinUsd[wallet];
+  }
+}
+
+async function getSolPriceUsd() {
+  const now = Date.now();
+
+  if (cachedSolPriceUsd && now - cachedSolPriceAt < SOL_PRICE_CACHE_MS) {
+    return cachedSolPriceUsd;
+  }
+
+  try {
+    const res = await axios.get(SOL_PRICE_API_URL, { timeout: 5000 });
+    const price = Number(res?.data?.solana?.usd);
+
+    if (Number.isFinite(price) && price > 0) {
+      cachedSolPriceUsd = price;
+      cachedSolPriceAt = now;
+      return price;
+    }
+  } catch (err) {
+    log("⚠️ getSolPriceUsd error:", err.message);
+  }
+
+  // fall back to last known price (even if stale) rather than blocking calls
+  return cachedSolPriceUsd;
+}
+
 function shouldCallForBurst(wallet, now = Date.now()) {
   const prevTxAt = Number(lastTxAt[wallet] || 0);
   lastTxAt[wallet] = now;
@@ -187,6 +258,7 @@ function saveState() {
       wallets: [...wallets],
       lastTxAt,
       lastCallAt,
+      walletMinUsd,
       lastPinnedMessageId,
       updatedAt: new Date().toISOString(),
     };
@@ -220,6 +292,10 @@ function loadState() {
         data.lastCallAt && typeof data.lastCallAt === "object"
           ? data.lastCallAt
           : {};
+      walletMinUsd =
+        data.walletMinUsd && typeof data.walletMinUsd === "object"
+          ? data.walletMinUsd
+          : {};
       lastPinnedMessageId =
         typeof data.lastPinnedMessageId === "number" ? data.lastPinnedMessageId : null;
     }
@@ -237,6 +313,7 @@ function loadState() {
     wallets = new Set(INITIAL_WATCH_WALLET ? [INITIAL_WATCH_WALLET.trim()] : []);
     lastTxAt = {};
     lastCallAt = {};
+    walletMinUsd = {};
     lastPinnedMessageId = null;
     saveState();
   }
@@ -311,7 +388,7 @@ async function placeSingleCall(to, twiml) {
   return call.sid;
 }
 
-async function makePhoneCall({ wallet, direction, solDelta }) {
+async function makePhoneCall({ wallet, direction, solDelta, activity }) {
   if (!ENABLE_CALL) {
     log("⚠️ ENABLE_CALL=false, skip call");
     return { ok: false, reason: "calls_disabled" };
@@ -333,7 +410,9 @@ async function makePhoneCall({ wallet, direction, solDelta }) {
   }
 
   const sayDelta =
-    typeof solDelta === "number"
+    activity?.kind === "token"
+      ? `Estimated ${activity.amount.toFixed(2)} ${activity.symbol}.`
+      : typeof solDelta === "number"
       ? `Estimated ${Math.abs(solDelta).toFixed(6)} sol.`
       : "A transaction was detected.";
 
@@ -469,14 +548,119 @@ function inferNativeSolTransfer(parsedTx, watchedWallet) {
   }
 }
 
-function buildAlertMessage({ wallet, signature, solDelta, slot, err, parsedTx }) {
-  const transfer = inferNativeSolTransfer(parsedTx, wallet);
+function inferTokenTransfers(parsedTx, watchedWallet) {
+  try {
+    const meta = parsedTx?.meta;
+    if (!meta) return [];
 
-  const title = transfer?.isIncoming
-    ? "🟢 <b>SOL Received</b>"
-    : transfer?.isOutgoing
-    ? "🔴 <b>SOL Sent</b>"
-    : "🚨 <b>Wallet Alert</b>";
+    const pre = meta.preTokenBalances || [];
+    const post = meta.postTokenBalances || [];
+    const preMap = new Map(pre.map((b) => [b.accountIndex, b]));
+    const postMap = new Map(post.map((b) => [b.accountIndex, b]));
+    const indices = new Set([...preMap.keys(), ...postMap.keys()]);
+
+    const results = [];
+    for (const idx of indices) {
+      const preBal = preMap.get(idx);
+      const postBal = postMap.get(idx);
+      const owner = postBal?.owner || preBal?.owner;
+      if (owner !== watchedWallet) continue;
+
+      const mint = postBal?.mint || preBal?.mint;
+      const preAmount = Number(preBal?.uiTokenAmount?.uiAmount ?? 0);
+      const postAmount = Number(postBal?.uiTokenAmount?.uiAmount ?? 0);
+      const delta = postAmount - preAmount;
+
+      if (!delta) continue;
+
+      results.push({
+        mint,
+        delta,
+        isIncoming: delta > 0,
+        isOutgoing: delta < 0,
+      });
+    }
+
+    return results;
+  } catch {
+    return [];
+  }
+}
+
+// Combines SPL-token transfers (e.g. USDT/USDC) and native SOL transfers into
+// one normalized "activity" describing what moved for the watched wallet.
+// Token transfers take priority since that's usually the real value moved
+// (native SOL delta in that case is just the tiny network fee).
+function buildActivity(parsedTx, watchedWallet) {
+  const tokenTransfers = inferTokenTransfers(parsedTx, watchedWallet);
+
+  if (tokenTransfers.length) {
+    const primary =
+      tokenTransfers.find((t) => getTokenInfo(t.mint)) || tokenTransfers[0];
+    const tokenInfo = getTokenInfo(primary.mint);
+    const amount = Math.abs(primary.delta);
+
+    return {
+      kind: "token",
+      amount,
+      symbol: tokenInfo?.symbol || `token(${shortAddress(primary.mint)})`,
+      mint: primary.mint,
+      isIncoming: primary.isIncoming,
+      isOutgoing: primary.isOutgoing,
+      usdValue: tokenInfo ? amount * tokenInfo.usdPerToken : null,
+      priced: Boolean(tokenInfo),
+    };
+  }
+
+  const nativeTransfer = inferNativeSolTransfer(parsedTx, watchedWallet);
+  if (nativeTransfer) {
+    return {
+      kind: "native",
+      amount: nativeTransfer.amountSol,
+      symbol: "SOL",
+      source: nativeTransfer.source,
+      destination: nativeTransfer.destination,
+      isIncoming: nativeTransfer.isIncoming,
+      isOutgoing: nativeTransfer.isOutgoing,
+      usdValue: null, // priced later using live SOL/USD rate
+      priced: false,
+    };
+  }
+
+  return null;
+}
+
+async function priceActivityUsd(activity, solDeltaFallback) {
+  if (activity?.kind === "token") {
+    return activity.usdValue; // stablecoin amount already ~= USD, or null if unknown token
+  }
+
+  const amountSol =
+    activity?.kind === "native"
+      ? activity.amount
+      : typeof solDeltaFallback === "number"
+      ? Math.abs(solDeltaFallback)
+      : null;
+
+  if (typeof amountSol !== "number") return null;
+
+  const solPrice = await getSolPriceUsd();
+  return typeof solPrice === "number" ? amountSol * solPrice : null;
+}
+
+function buildAlertMessage({ wallet, signature, solDelta, slot, err, parsedTx }) {
+  const activity = buildActivity(parsedTx, wallet);
+
+  const title =
+    activity?.kind === "token"
+      ? activity.isIncoming
+        ? `🟢 <b>${escapeHtml(activity.symbol)} Received</b>`
+        : `🔴 <b>${escapeHtml(activity.symbol)} Sent</b>`
+      : activity?.kind === "native"
+      ? activity.isIncoming
+        ? "🟢 <b>SOL Received</b>"
+        : "🔴 <b>SOL Sent</b>"
+      : "🚨 <b>Wallet Alert</b>";
 
   const walletShort = shortAddress(wallet);
   const walletLink = htmlLink(solscanAddressLink(wallet), walletShort);
@@ -487,17 +671,27 @@ function buildAlertMessage({ wallet, signature, solDelta, slot, err, parsedTx })
   let summary = "";
   let extra = "";
 
-  if (transfer) {
+  if (activity?.kind === "token") {
+    const verb = activity.isIncoming ? "received" : "sent";
+    summary = `💸 ${walletLink} ${verb} <b>${activity.amount.toFixed(
+      4
+    )} ${escapeHtml(activity.symbol)}</b>`;
+    extra = activity.priced
+      ? `≈ <b>$${activity.usdValue.toFixed(2)}</b>`
+      : `⚠️ Unknown token price (mint: <code>${escapeHtml(
+          shortAddress(activity.mint, 6, 6)
+        )}</code>)`;
+  } else if (activity?.kind === "native") {
     const fromLink = htmlLink(
-      solscanAddressLink(transfer.source),
-      shortAddress(transfer.source)
+      solscanAddressLink(activity.source),
+      shortAddress(activity.source)
     );
     const toLink = htmlLink(
-      solscanAddressLink(transfer.destination),
-      shortAddress(transfer.destination)
+      solscanAddressLink(activity.destination),
+      shortAddress(activity.destination)
     );
 
-    summary = `💸 ${fromLink} transferred <b>${transfer.amountSol.toFixed(
+    summary = `💸 ${fromLink} transferred <b>${activity.amount.toFixed(
       4
     )} SOL</b> to ${toLink}`;
 
@@ -530,33 +724,48 @@ function buildCallReasonMessage({
   slot,
   direction,
   parsedTx,
+  usdValue,
+  minUsd,
 }) {
-  const transfer = inferNativeSolTransfer(parsedTx, wallet);
+  const activity = buildActivity(parsedTx, wallet);
   const walletLink = htmlLink(solscanAddressLink(wallet), shortAddress(wallet));
   const signatureLink = signature
     ? htmlLink(solscanTxLink(signature), "Signature")
     : "N/A";
 
   let why = "";
-  if (transfer) {
+  let amountLine = "";
+
+  if (activity?.kind === "token") {
+    const verb = activity.isIncoming ? "received" : "sent";
+    why = `Detected token transfer: watched wallet ${verb} <b>${activity.amount.toFixed(
+      4
+    )} ${escapeHtml(activity.symbol)}</b>`;
+    amountLine = `💰 Amount: <b>${activity.amount.toFixed(4)} ${escapeHtml(
+      activity.symbol
+    )}</b>${activity.priced ? ` (≈ $${activity.usdValue.toFixed(2)})` : ""}`;
+  } else if (activity?.kind === "native") {
     const fromLink = htmlLink(
-      solscanAddressLink(transfer.source),
-      shortAddress(transfer.source)
+      solscanAddressLink(activity.source),
+      shortAddress(activity.source)
     );
     const toLink = htmlLink(
-      solscanAddressLink(transfer.destination),
-      shortAddress(transfer.destination)
+      solscanAddressLink(activity.destination),
+      shortAddress(activity.destination)
     );
 
-    why = `Detected transfer: ${fromLink} transferred <b>${transfer.amountSol.toFixed(
+    why = `Detected transfer: ${fromLink} transferred <b>${activity.amount.toFixed(
       4
     )} SOL</b> to ${toLink}`;
+    amountLine = `💰 SOL delta: <b>${activity.amount.toFixed(6)}</b>`;
   } else if (typeof solDelta === "number") {
     why = `Detected SOL delta change on watched wallet: <b>${solDelta.toFixed(
       6
     )} SOL</b>`;
+    amountLine = `💰 SOL delta: <b>${solDelta.toFixed(6)}</b>`;
   } else {
     why = `Detected a new transaction involving watched wallet`;
+    amountLine = "💰 Amount: <b>N/A</b>";
   }
 
   return [
@@ -565,15 +774,18 @@ function buildCallReasonMessage({
     `🕒 Time: <b>${escapeHtml(formatTimeVN())}</b>`,
     `👛 Wallet: ${walletLink}`,
     `📈 Direction: <b>${escapeHtml(direction)}</b>`,
-    typeof solDelta === "number"
-      ? `💰 SOL delta: <b>${solDelta.toFixed(6)}</b>`
-      : "💰 SOL delta: <b>N/A</b>",
+    amountLine,
     typeof slot === "number" ? `🧱 Slot: <code>${slot}</code>` : "",
     `🔗 ${signatureLink}`,
     "",
     `📝 Reason: ${why}`,
     `✅ Burst rule matched: first tx after cooldown window`,
-    `✅ Call is allowed even for tiny delta changes`,
+    minUsd > 0
+      ? `✅ /min threshold matched: $${(typeof usdValue === "number"
+          ? usdValue
+          : 0
+        ).toFixed(2)} >= $${minUsd.toFixed(2)}`
+      : `✅ Call is allowed even for tiny delta changes (no /min set)`,
   ]
     .filter(Boolean)
     .join("\n");
@@ -584,8 +796,16 @@ function shouldSendTelegramAlert(solDelta) {
   return Math.abs(solDelta) >= TELEGRAM_ALERT_MIN_SOL;
 }
 
-function shouldTriggerCall({ isNewBurst }) {
-  return ENABLE_CALL && isNewBurst;
+function shouldTriggerCall({ isNewBurst, minUsd, usdValue }) {
+  if (!ENABLE_CALL || !isNewBurst) return false;
+
+  if (minUsd > 0) {
+    // No price / amount available yet -> be safe and don't call blind
+    if (typeof usdValue !== "number") return false;
+    if (usdValue < minUsd) return false;
+  }
+
+  return true;
 }
 
 // ================= SUBSCRIPTIONS =================
@@ -609,7 +829,13 @@ async function handleWalletLog(wallet, logInfo, ctxInfo = {}) {
     const solDelta = inferWalletSolDelta(parsedTx, wallet);
     const direction = inferDirection(solDelta);
 
-    if (shouldSendTelegramAlert(solDelta)) {
+    const activity = buildActivity(parsedTx, wallet);
+    const minUsd = getWalletMinUsd(wallet);
+    const usdValue = await priceActivityUsd(activity, solDelta);
+
+    const isTokenActivity = activity?.kind === "token";
+
+    if (isTokenActivity || shouldSendTelegramAlert(solDelta)) {
       const msg = buildAlertMessage({
         wallet,
         signature,
@@ -625,11 +851,12 @@ async function handleWalletLog(wallet, logInfo, ctxInfo = {}) {
       );
     }
 
-    if (shouldTriggerCall({ isNewBurst })) {
+    if (shouldTriggerCall({ isNewBurst, minUsd, usdValue })) {
       const callResult = await makePhoneCall({
         wallet,
         direction,
         solDelta,
+        activity,
       });
 
       if (callResult.ok) {
@@ -640,6 +867,8 @@ async function handleWalletLog(wallet, logInfo, ctxInfo = {}) {
           slot,
           direction,
           parsedTx,
+          usdValue,
+          minUsd,
         });
 
         const pinResult = await sendAndPinTelegram(callReasonText);
@@ -671,7 +900,15 @@ async function handleWalletLog(wallet, logInfo, ctxInfo = {}) {
         log(`❌ Call failed for ${wallet} sig=${signature}: ${callResult.reason}`);
       }
     } else {
-      const reason = !ENABLE_CALL ? "calls disabled" : "burst active";
+      let reason = "burst active";
+      if (!ENABLE_CALL) {
+        reason = "calls disabled";
+      } else if (minUsd > 0 && (typeof usdValue !== "number" || usdValue < minUsd)) {
+        reason =
+          typeof usdValue === "number"
+            ? `below /min threshold ($${usdValue.toFixed(2)} < $${minUsd.toFixed(2)})`
+            : `price unavailable, /min threshold set ($${minUsd.toFixed(2)})`;
+      }
       log(`⏭ Skip call for ${wallet} sig=${signature} (${reason})`);
     }
 
@@ -736,6 +973,8 @@ async function registerTelegramCommands() {
       { command: "calloff", description: "Tắt gọi điện" },
       { command: "addwallet", description: "Thêm wallet theo dõi" },
       { command: "removewallet", description: "Xóa wallet theo dõi" },
+      { command: "min", description: "Đặt ngưỡng USD để gọi điện" },
+      { command: "listmin", description: "Xem ngưỡng USD theo wallet" },
       { command: "list", description: "Xem danh sách wallet" },
       { command: "status", description: "Xem trạng thái bot" },
       { command: "testalert", description: "Gửi alert test" },
@@ -760,6 +999,8 @@ bot.start(async (ctx) => {
       "/calloff",
       "/addwallet <address>",
       "/removewallet <address>",
+      "/min <wallet> <number>  (chỉ gọi khi tx >= $number)",
+      "/listmin",
       "/list",
       "/status",
       "/testalert",
@@ -782,6 +1023,9 @@ bot.command("status", async (ctx) => {
       `📞 Calls: ${ENABLE_CALL ? "ON" : "OFF"}`,
       `🔕 Telegram hide under: ${TELEGRAM_ALERT_MIN_SOL} SOL`,
       `👀 Wallet count: ${wallets.size}`,
+      `💵 Wallets with /min threshold: ${
+        Object.values(walletMinUsd).filter((v) => Number(v) > 0).length
+      } (dùng /listmin để xem chi tiết)`,
       `🔌 Active subscriptions: ${subscriptions.size}`,
       `⏱ Burst window: ${Math.floor(CALL_BURST_WINDOW_MS / 1000)} giây`,
       `📱 Target phones: ${
@@ -865,6 +1109,7 @@ bot.command("removewallet", async (ctx) => {
   const existed = wallets.delete(wallet);
   delete lastTxAt[wallet];
   delete lastCallAt[wallet];
+  delete walletMinUsd[wallet];
   saveState();
   await unsubscribeWallet(wallet);
 
@@ -875,6 +1120,76 @@ bot.command("removewallet", async (ctx) => {
   } else {
     await ctx.reply("❌ Wallet không tồn tại.");
   }
+});
+
+bot.command("min", async (ctx) => {
+  if (!requireAdmin(ctx)) return;
+
+  const text = ctx.message?.text || "";
+  const parts = text.split(/\s+/).slice(1);
+  const wallet = normalizeWallet(parts[0]);
+  const amountRaw = parts[1];
+
+  if (!wallet || amountRaw === undefined) {
+    await ctx.reply(
+      "Dùng: /min <wallet> <number>\nVí dụ: /min <wallet> 1000\n(Chỉ gọi điện khi giá trị giao dịch >= 1000 USD)\nDùng /min <wallet> 0 để tắt ngưỡng."
+    );
+    return;
+  }
+
+  if (!isValidWallet(wallet)) {
+    await ctx.reply("❌ Wallet không hợp lệ.");
+    return;
+  }
+
+  const amount = Number(amountRaw);
+  if (!Number.isFinite(amount) || amount < 0) {
+    await ctx.reply("❌ Số tiền không hợp lệ. Dùng: /min <wallet> <number>");
+    return;
+  }
+
+  setWalletMinUsd(wallet, amount);
+  saveState();
+
+  if (!wallets.has(wallet)) {
+    await ctx.reply(
+      `⚠️ Wallet chưa nằm trong danh sách theo dõi. Dùng /addwallet ${wallet} để bắt đầu theo dõi.`
+    );
+  }
+
+  if (amount > 0) {
+    await ctx.reply(
+      `✅ Đã đặt ngưỡng gọi điện cho wallet:\n<code>${escapeHtml(
+        wallet
+      )}</code>\n💵 Chỉ gọi khi giao dịch >= $${amount.toFixed(2)}`,
+      { parse_mode: "HTML" }
+    );
+  } else {
+    await ctx.reply(
+      `✅ Đã tắt ngưỡng USD cho wallet:\n<code>${escapeHtml(
+        wallet
+      )}</code>\n📞 Bot sẽ gọi cho mọi giao dịch (theo rule burst) như trước.`,
+      { parse_mode: "HTML" }
+    );
+  }
+});
+
+bot.command("listmin", async (ctx) => {
+  if (!requireAdmin(ctx)) return;
+
+  const entries = Object.entries(walletMinUsd).filter(([, v]) => Number(v) > 0);
+
+  if (!entries.length) {
+    await ctx.reply("📭 Chưa có wallet nào đặt ngưỡng /min.");
+    return;
+  }
+
+  await ctx.reply(
+    `💵 Ngưỡng gọi điện theo wallet:\n${entries
+      .map(([w, v], i) => `${i + 1}. <code>${escapeHtml(w)}</code> — >= $${Number(v).toFixed(2)}`)
+      .join("\n")}`,
+    { parse_mode: "HTML" }
+  );
 });
 
 bot.command("list", async (ctx) => {
@@ -1005,6 +1320,8 @@ await bot.telegram.setMyCommands([
   { command: "calloff", description: "Tắt gọi điện" },
   { command: "addwallet", description: "Thêm wallet" },
   { command: "removewallet", description: "Xóa wallet" },
+  { command: "min", description: "Đặt ngưỡng USD để gọi điện" },
+  { command: "listmin", description: "Xem ngưỡng USD theo wallet" },
   { command: "list", description: "Danh sách wallet" },
   { command: "status", description: "Xem trạng thái bot" },
   { command: "testalert", description: "Test alert + call" },
