@@ -2,7 +2,6 @@ require("dotenv").config();
 
 const { Telegraf } = require("telegraf");
 const { Connection, PublicKey, LAMPORTS_PER_SOL } = require("@solana/web3.js");
-const twilio = require("twilio");
 const axios = require("axios");
 const fs = require("fs");
 const path = require("path");
@@ -20,10 +19,12 @@ const SOLANA_RPC_WSS =
 
 const INITIAL_WATCH_WALLET = process.env.WATCH_WALLET || "";
 const CALL_BURST_WINDOW_MS = Number(
-  process.env.CALL_BURST_WINDOW_MS || 5 * 60 * 1000
+  process.env.CALL_BURST_WINDOW_MS || 5 * 60 * 1000,
 );
 const PORT = Number(process.env.PORT || 3001);
-const TELEGRAM_ALERT_MIN_SOL = Number(process.env.TELEGRAM_ALERT_MIN_SOL || 0.001);
+const TELEGRAM_ALERT_MIN_SOL = Number(
+  process.env.TELEGRAM_ALERT_MIN_SOL || 0.001,
+);
 
 // USD price feed (used by /min threshold)
 const SOL_PRICE_API_URL =
@@ -34,8 +35,14 @@ const SOL_PRICE_CACHE_MS = Number(process.env.SOL_PRICE_CACHE_MS || 30 * 1000);
 // Known SPL token mints treated as ~1 USD per token (stablecoins).
 // Add more via KNOWN_TOKEN_MINTS env: "mint1:SYMBOL:usdPerToken,mint2:SYMBOL:usdPerToken"
 const KNOWN_TOKENS = {
-  Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB: { symbol: "USDT", usdPerToken: 1 },
-  EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v: { symbol: "USDC", usdPerToken: 1 },
+  Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB: {
+    symbol: "USDT",
+    usdPerToken: 1,
+  },
+  EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v: {
+    symbol: "USDC",
+    usdPerToken: 1,
+  },
 };
 
 if (process.env.KNOWN_TOKEN_MINTS) {
@@ -54,16 +61,20 @@ function getTokenInfo(mint) {
 let ENABLE_CALL =
   String(process.env.ENABLE_CALL || "false").toLowerCase() === "true";
 
-const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID || "";
-const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN || "";
-const TWILIO_PHONE_NUMBER = process.env.TWILIO_PHONE_NUMBER || "";
+const BARK_URL = String(process.env.BARK_URL || "https://api.day.app")
+  .trim()
+  .replace(/\/+$/, "");
 
-const YOUR_PHONE_NUMBERS = String(
-  process.env.YOUR_PHONE_NUMBERS || process.env.YOUR_PHONE_NUMBER || ""
-)
-  .split(",")
-  .map((x) => x.trim())
-  .filter(Boolean);
+function getBarkApiKeys() {
+  const keys = [
+    process.env.BARK_API_KEY_1,
+    process.env.BARK_API_KEY_2,
+    ...(process.env.BARK_API_KEYS ? process.env.BARK_API_KEYS.split(",") : []),
+  ];
+  return Array.from(
+    new Set(keys.map((k) => String(k || "").trim()).filter(Boolean)),
+  );
+}
 
 if (!BOT_TOKEN) {
   console.error("❌ Missing BOT_TOKEN");
@@ -79,11 +90,6 @@ const connection = new Connection(SOLANA_RPC_HTTP, {
   commitment: "confirmed",
   wsEndpoint: SOLANA_RPC_WSS,
 });
-
-const twilioClient =
-  TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN
-    ? twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-    : null;
 
 let isEnabled = true;
 let wallets = new Set();
@@ -283,7 +289,7 @@ function loadState() {
       wallets = new Set(
         Array.isArray(data.wallets)
           ? data.wallets.map((x) => String(x).trim()).filter(Boolean)
-          : []
+          : [],
       );
 
       lastTxAt =
@@ -297,7 +303,9 @@ function loadState() {
           ? data.walletMinUsd
           : {};
       lastPinnedMessageId =
-        typeof data.lastPinnedMessageId === "number" ? data.lastPinnedMessageId : null;
+        typeof data.lastPinnedMessageId === "number"
+          ? data.lastPinnedMessageId
+          : null;
     }
 
     if (INITIAL_WATCH_WALLET) {
@@ -310,7 +318,9 @@ function loadState() {
     isEnabled = true;
     ENABLE_CALL =
       String(process.env.ENABLE_CALL || "false").toLowerCase() === "true";
-    wallets = new Set(INITIAL_WATCH_WALLET ? [INITIAL_WATCH_WALLET.trim()] : []);
+    wallets = new Set(
+      INITIAL_WATCH_WALLET ? [INITIAL_WATCH_WALLET.trim()] : [],
+    );
     lastTxAt = {};
     lastCallAt = {};
     walletMinUsd = {};
@@ -335,7 +345,7 @@ async function sendTelegram(text, extra = {}) {
   } catch (err) {
     console.error(
       "sendTelegram error:",
-      err?.response?.description || err.message
+      err?.response?.description || err.message,
     );
     return null;
   }
@@ -349,7 +359,10 @@ async function pinTelegramMessage(messageId) {
       try {
         await bot.telegram.unpinChatMessage(CHAT_ID, lastPinnedMessageId);
       } catch (err) {
-        log("unpin old message skipped:", err?.response?.description || err.message);
+        log(
+          "unpin old message skipped:",
+          err?.response?.description || err.message,
+        );
       }
     }
 
@@ -363,7 +376,7 @@ async function pinTelegramMessage(messageId) {
   } catch (err) {
     console.error(
       "pinTelegramMessage error:",
-      err?.response?.description || err.message
+      err?.response?.description || err.message,
     );
     return false;
   }
@@ -379,56 +392,72 @@ async function sendAndPinTelegram(text) {
   return { ok: true, sent, pinned };
 }
 
-async function placeSingleCall(to, twiml) {
-  const call = await twilioClient.calls.create({
-    twiml,
-    to,
-    from: TWILIO_PHONE_NUMBER,
-  });
-  return call.sid;
-}
-
-async function makePhoneCall({ wallet, direction, solDelta, activity }) {
+async function sendBarkNotification({
+  wallet,
+  direction,
+  solDelta,
+  activity,
+  signature,
+}) {
   if (!ENABLE_CALL) {
-    log("⚠️ ENABLE_CALL=false, skip call");
-    return { ok: false, reason: "calls_disabled" };
+    log("⚠️ ENABLE_CALL=false, skip Bark alert");
+    return { ok: false, reason: "bark_disabled" };
   }
 
-  if (!twilioClient) {
-    log("⚠️ Twilio not configured, skip call");
-    return { ok: false, reason: "twilio_not_configured" };
+  const barkKeys = getBarkApiKeys();
+  if (!barkKeys.length) {
+    log("⚠️ Missing Bark API keys (BARK_API_KEY_1, BARK_API_KEY_2)");
+    return { ok: false, reason: "missing_bark_api_keys" };
   }
 
-  if (!TWILIO_PHONE_NUMBER) {
-    log("⚠️ Missing TWILIO_PHONE_NUMBER");
-    return { ok: false, reason: "missing_twilio_from_number" };
-  }
-
-  if (!YOUR_PHONE_NUMBERS.length) {
-    log("⚠️ Missing YOUR_PHONE_NUMBERS");
-    return { ok: false, reason: "missing_target_phone_numbers" };
-  }
-
-  const sayDelta =
+  const amountText =
     activity?.kind === "token"
-      ? `Estimated ${activity.amount.toFixed(2)} ${activity.symbol}.`
+      ? `${activity.amount.toFixed(4)} ${activity.symbol}`
       : typeof solDelta === "number"
-      ? `Estimated ${Math.abs(solDelta).toFixed(6)} sol.`
-      : "A transaction was detected.";
+        ? `${Math.abs(solDelta).toFixed(6)} SOL`
+        : "N/A";
 
-  const text = `Alert. Wallet activity detected. ${direction}. ${sayDelta} Check Telegram for details.`;
-  const twiml = `<Response><Say voice="alice">${text}</Say></Response>`;
+  const title = `🚨 SOLANA ALERT (${direction || "Activity Detected"})`;
+  const bodyText = `👛 Wallet: ${shortAddress(wallet)}\n💰 Amount: ${amountText}\n🕒 Time: ${formatTimeVN()}`;
+  const clickUrl = signature
+    ? solscanTxLink(signature)
+    : solscanAddressLink(wallet);
+
+  const payload = {
+    title,
+    body: bodyText,
+    group: "solana_wallet_alert",
+    sound: "alarm",
+    call: "1",
+    level: "timeSensitive",
+    url: clickUrl,
+    isArchive: 1,
+  };
 
   const results = [];
 
-  for (const phone of YOUR_PHONE_NUMBERS) {
+  for (const key of barkKeys) {
     try {
-      const sid = await placeSingleCall(phone, twiml);
-      log(`📞 Twilio call placed to ${phone}: ${sid}`);
-      results.push({ phone, ok: true, sid });
+      const response = await axios.post(`${BARK_URL}/${key}`, payload, {
+        headers: { "Content-Type": "application/json; charset=utf-8" },
+        timeout: 10000,
+      });
+
+      if (response.data?.code === 200 || response.status === 200) {
+        log(`🔔 Bark push sent to key ${shortAddress(key, 4, 4)} successfully`);
+        results.push({ key, ok: true });
+      } else {
+        const msg = response.data?.message || `HTTP ${response.status}`;
+        log(`❌ Bark push failed for key ${shortAddress(key, 4, 4)}: ${msg}`);
+        results.push({ key, ok: false, error: msg });
+      }
     } catch (err) {
-      console.error(`Twilio call error for ${phone}:`, err.message);
-      results.push({ phone, ok: false, error: err.message });
+      const errMsg = err?.response?.data?.message || err.message;
+      console.error(
+        `Bark push error for key ${shortAddress(key, 4, 4)}:`,
+        errMsg,
+      );
+      results.push({ key, ok: false, error: errMsg });
     }
   }
 
@@ -441,9 +470,15 @@ async function makePhoneCall({ wallet, direction, solDelta, activity }) {
 
   return {
     ok: false,
-    reason: results.map((x) => `${x.phone}: ${x.error || "failed"}`).join(" | "),
+    reason: results
+      .map((x) => `${shortAddress(x.key, 4, 4)}: ${x.error || "failed"}`)
+      .join(" | "),
     results,
   };
+}
+
+async function makePhoneCall(params) {
+  return sendBarkNotification(params);
 }
 
 async function getParsedTx(signature) {
@@ -473,10 +508,10 @@ function inferWalletSolDelta(parsedTx, wallet) {
         typeof k?.pubkey?.toBase58 === "function"
           ? k.pubkey.toBase58()
           : typeof k?.pubkey === "string"
-          ? k.pubkey
-          : typeof k?.toBase58 === "function"
-          ? k.toBase58()
-          : String(k);
+            ? k.pubkey
+            : typeof k?.toBase58 === "function"
+              ? k.toBase58()
+              : String(k);
 
       if (pubkey === wallet) {
         idx = i;
@@ -639,8 +674,8 @@ async function priceActivityUsd(activity, solDeltaFallback) {
     activity?.kind === "native"
       ? activity.amount
       : typeof solDeltaFallback === "number"
-      ? Math.abs(solDeltaFallback)
-      : null;
+        ? Math.abs(solDeltaFallback)
+        : null;
 
   if (typeof amountSol !== "number") return null;
 
@@ -648,7 +683,14 @@ async function priceActivityUsd(activity, solDeltaFallback) {
   return typeof solPrice === "number" ? amountSol * solPrice : null;
 }
 
-function buildAlertMessage({ wallet, signature, solDelta, slot, err, parsedTx }) {
+function buildAlertMessage({
+  wallet,
+  signature,
+  solDelta,
+  slot,
+  err,
+  parsedTx,
+}) {
   const activity = buildActivity(parsedTx, wallet);
 
   const title =
@@ -657,10 +699,10 @@ function buildAlertMessage({ wallet, signature, solDelta, slot, err, parsedTx })
         ? `🟢 <b>${escapeHtml(activity.symbol)} Received</b>`
         : `🔴 <b>${escapeHtml(activity.symbol)} Sent</b>`
       : activity?.kind === "native"
-      ? activity.isIncoming
-        ? "🟢 <b>SOL Received</b>"
-        : "🔴 <b>SOL Sent</b>"
-      : "🚨 <b>Wallet Alert</b>";
+        ? activity.isIncoming
+          ? "🟢 <b>SOL Received</b>"
+          : "🔴 <b>SOL Sent</b>"
+        : "🚨 <b>Wallet Alert</b>";
 
   const walletShort = shortAddress(wallet);
   const walletLink = htmlLink(solscanAddressLink(wallet), walletShort);
@@ -674,25 +716,25 @@ function buildAlertMessage({ wallet, signature, solDelta, slot, err, parsedTx })
   if (activity?.kind === "token") {
     const verb = activity.isIncoming ? "received" : "sent";
     summary = `💸 ${walletLink} ${verb} <b>${activity.amount.toFixed(
-      4
+      4,
     )} ${escapeHtml(activity.symbol)}</b>`;
     extra = activity.priced
       ? `≈ <b>$${activity.usdValue.toFixed(2)}</b>`
       : `⚠️ Unknown token price (mint: <code>${escapeHtml(
-          shortAddress(activity.mint, 6, 6)
+          shortAddress(activity.mint, 6, 6),
         )}</code>)`;
   } else if (activity?.kind === "native") {
     const fromLink = htmlLink(
       solscanAddressLink(activity.source),
-      shortAddress(activity.source)
+      shortAddress(activity.source),
     );
     const toLink = htmlLink(
       solscanAddressLink(activity.destination),
-      shortAddress(activity.destination)
+      shortAddress(activity.destination),
     );
 
     summary = `💸 ${fromLink} transferred <b>${activity.amount.toFixed(
-      4
+      4,
     )} SOL</b> to ${toLink}`;
 
     extra = `👀 Watched wallet: ${walletLink}`;
@@ -739,28 +781,28 @@ function buildCallReasonMessage({
   if (activity?.kind === "token") {
     const verb = activity.isIncoming ? "received" : "sent";
     why = `Detected token transfer: watched wallet ${verb} <b>${activity.amount.toFixed(
-      4
+      4,
     )} ${escapeHtml(activity.symbol)}</b>`;
     amountLine = `💰 Amount: <b>${activity.amount.toFixed(4)} ${escapeHtml(
-      activity.symbol
+      activity.symbol,
     )}</b>${activity.priced ? ` (≈ $${activity.usdValue.toFixed(2)})` : ""}`;
   } else if (activity?.kind === "native") {
     const fromLink = htmlLink(
       solscanAddressLink(activity.source),
-      shortAddress(activity.source)
+      shortAddress(activity.source),
     );
     const toLink = htmlLink(
       solscanAddressLink(activity.destination),
-      shortAddress(activity.destination)
+      shortAddress(activity.destination),
     );
 
     why = `Detected transfer: ${fromLink} transferred <b>${activity.amount.toFixed(
-      4
+      4,
     )} SOL</b> to ${toLink}`;
     amountLine = `💰 SOL delta: <b>${activity.amount.toFixed(6)}</b>`;
   } else if (typeof solDelta === "number") {
     why = `Detected SOL delta change on watched wallet: <b>${solDelta.toFixed(
-      6
+      6,
     )} SOL</b>`;
     amountLine = `💰 SOL delta: <b>${solDelta.toFixed(6)}</b>`;
   } else {
@@ -769,7 +811,7 @@ function buildCallReasonMessage({
   }
 
   return [
-    "📞 <b>CALL TRIGGERED</b>",
+    "🔔 <b>BARK ALERT TRIGGERED</b>",
     "",
     `🕒 Time: <b>${escapeHtml(formatTimeVN())}</b>`,
     `👛 Wallet: ${walletLink}`,
@@ -785,7 +827,7 @@ function buildCallReasonMessage({
           ? usdValue
           : 0
         ).toFixed(2)} >= $${minUsd.toFixed(2)}`
-      : `✅ Call is allowed even for tiny delta changes (no /min set)`,
+      : `✅ Bark alert is allowed even for tiny delta changes (no /min set)`,
   ]
     .filter(Boolean)
     .join("\n");
@@ -847,16 +889,17 @@ async function handleWalletLog(wallet, logInfo, ctxInfo = {}) {
       await sendTelegram(msg);
     } else {
       log(
-        `🔕 Telegram alert hidden for ${wallet} sig=${signature} because abs(solDelta) < ${TELEGRAM_ALERT_MIN_SOL}`
+        `🔕 Telegram alert hidden for ${wallet} sig=${signature} because abs(solDelta) < ${TELEGRAM_ALERT_MIN_SOL}`,
       );
     }
 
     if (shouldTriggerCall({ isNewBurst, minUsd, usdValue })) {
-      const callResult = await makePhoneCall({
+      const callResult = await sendBarkNotification({
         wallet,
         direction,
         solDelta,
         activity,
+        signature,
       });
 
       if (callResult.ok) {
@@ -874,13 +917,13 @@ async function handleWalletLog(wallet, logInfo, ctxInfo = {}) {
         const pinResult = await sendAndPinTelegram(callReasonText);
 
         if (!pinResult.pinned) {
-          log(`⚠️ Call detail message sent but pin failed for ${wallet}`);
+          log(`⚠️ Bark detail message sent but pin failed for ${wallet}`);
         }
 
-        log(`📞 Burst call sent for ${wallet} sig=${signature}`);
+        log(`🔔 Bark alert sent for ${wallet} sig=${signature}`);
       } else {
         const failMsg = [
-          "📵 <b>CALL FAILED</b>",
+          "📵 <b>BARK ALERT FAILED</b>",
           "",
           `🕒 Time: <b>${escapeHtml(formatTimeVN())}</b>`,
           `👛 Wallet: ${htmlLink(solscanAddressLink(wallet), shortAddress(wallet))}`,
@@ -897,19 +940,24 @@ async function handleWalletLog(wallet, logInfo, ctxInfo = {}) {
           .join("\n");
 
         await sendTelegram(failMsg);
-        log(`❌ Call failed for ${wallet} sig=${signature}: ${callResult.reason}`);
+        log(
+          `❌ Bark alert failed for ${wallet} sig=${signature}: ${callResult.reason}`,
+        );
       }
     } else {
       let reason = "burst active";
       if (!ENABLE_CALL) {
-        reason = "calls disabled";
-      } else if (minUsd > 0 && (typeof usdValue !== "number" || usdValue < minUsd)) {
+        reason = "bark notifications disabled";
+      } else if (
+        minUsd > 0 &&
+        (typeof usdValue !== "number" || usdValue < minUsd)
+      ) {
         reason =
           typeof usdValue === "number"
             ? `below /min threshold ($${usdValue.toFixed(2)} < $${minUsd.toFixed(2)})`
             : `price unavailable, /min threshold set ($${minUsd.toFixed(2)})`;
       }
-      log(`⏭ Skip call for ${wallet} sig=${signature} (${reason})`);
+      log(`⏭ Skip Bark alert for ${wallet} sig=${signature} (${reason})`);
     }
 
     log(`✅ Processing done for ${wallet} sig=${signature}`);
@@ -929,7 +977,7 @@ async function subscribeWallet(wallet) {
       async (logInfo, ctx) => {
         await handleWalletLog(wallet, logInfo, ctx);
       },
-      "confirmed"
+      "confirmed",
     );
 
     subscriptions.set(wallet, subId);
@@ -969,15 +1017,15 @@ async function registerTelegramCommands() {
     await bot.telegram.setMyCommands([
       { command: "on", description: "Bật alert" },
       { command: "off", description: "Tắt alert" },
-      { command: "callon", description: "Bật gọi điện" },
-      { command: "calloff", description: "Tắt gọi điện" },
+      { command: "callon", description: "Bật Bark alert" },
+      { command: "calloff", description: "Tắt Bark alert" },
       { command: "addwallet", description: "Thêm wallet theo dõi" },
       { command: "removewallet", description: "Xóa wallet theo dõi" },
-      { command: "min", description: "Đặt ngưỡng USD để gọi điện" },
+      { command: "min", description: "Đặt ngưỡng USD để gửi Bark alert" },
       { command: "listmin", description: "Xem ngưỡng USD theo wallet" },
       { command: "list", description: "Xem danh sách wallet" },
       { command: "status", description: "Xem trạng thái bot" },
-      { command: "testalert", description: "Gửi alert test" },
+      { command: "testalert", description: "Gửi alert test + Bark notify" },
       { command: "ping", description: "Kiểm tra bot còn sống" },
     ]);
     log("✅ Telegram command menu registered");
@@ -999,13 +1047,13 @@ bot.start(async (ctx) => {
       "/calloff",
       "/addwallet <address>",
       "/removewallet <address>",
-      "/min <wallet> <number>  (chỉ gọi khi tx >= $number)",
+      "/min <wallet> <number>  (chỉ gửi Bark alert khi tx >= $number)",
       "/listmin",
       "/list",
       "/status",
       "/testalert",
       "/ping",
-    ].join("\n")
+    ].join("\n"),
   );
 });
 
@@ -1017,10 +1065,12 @@ bot.command("ping", async (ctx) => {
 bot.command("status", async (ctx) => {
   if (!requireAdmin(ctx)) return;
 
+  const barkKeys = getBarkApiKeys();
+
   await ctx.reply(
     [
       `⚙️ Status: ${isEnabled ? "ON" : "OFF"}`,
-      `📞 Calls: ${ENABLE_CALL ? "ON" : "OFF"}`,
+      `🔔 Bark Alert: ${ENABLE_CALL ? "ON" : "OFF"}`,
       `🔕 Telegram hide under: ${TELEGRAM_ALERT_MIN_SOL} SOL`,
       `👀 Wallet count: ${wallets.size}`,
       `💵 Wallets with /min threshold: ${
@@ -1028,13 +1078,15 @@ bot.command("status", async (ctx) => {
       } (dùng /listmin để xem chi tiết)`,
       `🔌 Active subscriptions: ${subscriptions.size}`,
       `⏱ Burst window: ${Math.floor(CALL_BURST_WINDOW_MS / 1000)} giây`,
-      `📱 Target phones: ${
-        YOUR_PHONE_NUMBERS.length ? YOUR_PHONE_NUMBERS.join(", ") : "(missing)"
+      `📱 Bark Keys (${barkKeys.length}): ${
+        barkKeys.length
+          ? barkKeys.map((k) => shortAddress(k, 4, 4)).join(", ")
+          : "(missing)"
       }`,
       `💬 Alert chat: ${CHAT_ID || "(missing)"}`,
       `🌐 RPC: ${truncate(SOLANA_RPC_HTTP, 90)}`,
       `📡 WSS: ${truncate(SOLANA_RPC_WSS, 90)}`,
-    ].join("\n")
+    ].join("\n"),
   );
 });
 
@@ -1058,7 +1110,7 @@ bot.command("calloff", async (ctx) => {
   ENABLE_CALL = false;
   saveState();
 
-  await ctx.reply("📞 Call OFF");
+  await ctx.reply("🔔 Bark Alert OFF");
 });
 
 bot.command("callon", async (ctx) => {
@@ -1067,7 +1119,7 @@ bot.command("callon", async (ctx) => {
   ENABLE_CALL = true;
   saveState();
 
-  await ctx.reply("📞 Call ON");
+  await ctx.reply("🔔 Bark Alert ON");
 });
 
 bot.command("addwallet", async (ctx) => {
@@ -1132,7 +1184,7 @@ bot.command("min", async (ctx) => {
 
   if (!wallet || amountRaw === undefined) {
     await ctx.reply(
-      "Dùng: /min <wallet> <number>\nVí dụ: /min <wallet> 1000\n(Chỉ gọi điện khi giá trị giao dịch >= 1000 USD)\nDùng /min <wallet> 0 để tắt ngưỡng."
+      "Dùng: /min <wallet> <number>\nVí dụ: /min <wallet> 1000\n(Chỉ gửi Bark alert khi giá trị giao dịch >= 1000 USD)\nDùng /min <wallet> 0 để tắt ngưỡng.",
     );
     return;
   }
@@ -1153,23 +1205,23 @@ bot.command("min", async (ctx) => {
 
   if (!wallets.has(wallet)) {
     await ctx.reply(
-      `⚠️ Wallet chưa nằm trong danh sách theo dõi. Dùng /addwallet ${wallet} để bắt đầu theo dõi.`
+      `⚠️ Wallet chưa nằm trong danh sách theo dõi. Dùng /addwallet ${wallet} để bắt đầu theo dõi.`,
     );
   }
 
   if (amount > 0) {
     await ctx.reply(
-      `✅ Đã đặt ngưỡng gọi điện cho wallet:\n<code>${escapeHtml(
-        wallet
-      )}</code>\n💵 Chỉ gọi khi giao dịch >= $${amount.toFixed(2)}`,
-      { parse_mode: "HTML" }
+      `✅ Đã đặt ngưỡng gửi Bark alert cho wallet:\n<code>${escapeHtml(
+        wallet,
+      )}</code>\n💵 Chỉ alert khi giao dịch >= $${amount.toFixed(2)}`,
+      { parse_mode: "HTML" },
     );
   } else {
     await ctx.reply(
       `✅ Đã tắt ngưỡng USD cho wallet:\n<code>${escapeHtml(
-        wallet
-      )}</code>\n📞 Bot sẽ gọi cho mọi giao dịch (theo rule burst) như trước.`,
-      { parse_mode: "HTML" }
+        wallet,
+      )}</code>\n🔔 Bot sẽ gửi Bark alert cho mọi giao dịch (theo rule burst) như trước.`,
+      { parse_mode: "HTML" },
     );
   }
 });
@@ -1185,10 +1237,13 @@ bot.command("listmin", async (ctx) => {
   }
 
   await ctx.reply(
-    `💵 Ngưỡng gọi điện theo wallet:\n${entries
-      .map(([w, v], i) => `${i + 1}. <code>${escapeHtml(w)}</code> — >= $${Number(v).toFixed(2)}`)
+    `💵 Ngưỡng Bark alert theo wallet:\n${entries
+      .map(
+        ([w, v], i) =>
+          `${i + 1}. <code>${escapeHtml(w)}</code> — >= $${Number(v).toFixed(2)}`,
+      )
       .join("\n")}`,
-    { parse_mode: "HTML" }
+    { parse_mode: "HTML" },
   );
 });
 
@@ -1205,7 +1260,7 @@ bot.command("list", async (ctx) => {
     `📌 Wallets đang watch:\n${list
       .map((w, i) => `${i + 1}. <code>${escapeHtml(w)}</code>`)
       .join("\n")}`,
-    { parse_mode: "HTML" }
+    { parse_mode: "HTML" },
   );
 });
 
@@ -1213,7 +1268,9 @@ bot.command("testalert", async (ctx) => {
   if (!requireAdmin(ctx)) return;
 
   const wallet =
-    [...wallets][0] || INITIAL_WATCH_WALLET || "11111111111111111111111111111111";
+    [...wallets][0] ||
+    INITIAL_WATCH_WALLET ||
+    "11111111111111111111111111111111";
 
   const msg = buildAlertMessage({
     wallet,
@@ -1239,34 +1296,37 @@ bot.command("testalert", async (ctx) => {
     await sendAndPinTelegram(callInfoMsg);
   }
 
-  const result = await makePhoneCall({
+  const result = await sendBarkNotification({
     wallet,
     direction: "Outgoing transfer detected",
     solDelta: -0.223456,
+    signature: "5Qx1TESTabc123signatureXYZ",
   });
 
   if (result.ok) {
-    const okCalls = result.results
+    const okBark = result.results
       .filter((x) => x.ok)
-      .map((x) => `${x.phone}: ${x.sid}`)
+      .map((x) => `Key ${shortAddress(x.key, 4, 4)}: Success`)
       .join("\n");
 
-    const failedCalls = result.results
+    const failedBark = result.results
       .filter((x) => !x.ok)
-      .map((x) => `${x.phone}: ${x.error}`)
+      .map((x) => `Key ${shortAddress(x.key, 4, 4)}: ${x.error}`)
       .join("\n");
 
     await ctx.reply(
       [
         "🧪 Test alert sent.",
-        okCalls ? `📞 Success:\n${okCalls}` : "",
-        failedCalls ? `❌ Failed:\n${failedCalls}` : "",
+        okBark ? `🔔 Bark Success:\n${okBark}` : "",
+        failedBark ? `❌ Bark Failed:\n${failedBark}` : "",
       ]
         .filter(Boolean)
-        .join("\n\n")
+        .join("\n\n"),
     );
   } else {
-    await ctx.reply(`🧪 Telegram test sent.\n❌ Call failed: ${result.reason}`);
+    await ctx.reply(
+      `🧪 Telegram test sent.\n❌ Bark push failed: ${result.reason}`,
+    );
   }
 });
 
@@ -1313,20 +1373,7 @@ async function start() {
 
   try {
     await bot.launch();
-await bot.telegram.setMyCommands([
-  { command: "on", description: "Bật alert" },
-  { command: "off", description: "Tắt alert" },
-  { command: "callon", description: "Bật gọi điện" },
-  { command: "calloff", description: "Tắt gọi điện" },
-  { command: "addwallet", description: "Thêm wallet" },
-  { command: "removewallet", description: "Xóa wallet" },
-  { command: "min", description: "Đặt ngưỡng USD để gọi điện" },
-  { command: "listmin", description: "Xem ngưỡng USD theo wallet" },
-  { command: "list", description: "Danh sách wallet" },
-  { command: "status", description: "Xem trạng thái bot" },
-  { command: "testalert", description: "Test alert + call" },
-  { command: "ping", description: "Check bot sống" },
-]);
+    await registerTelegramCommands();
     log("🤖 Telegram bot started");
   } catch (err) {
     console.error("❌ Telegram bot failed to start:", err.message);
@@ -1336,14 +1383,17 @@ await bot.telegram.setMyCommands([
     log(`🚀 Health server listening on port ${PORT}`);
   });
 
-  setInterval(async () => {
-    try {
-      log("♻️ Periodic resubscribe check...");
-      await resubscribeAll();
-    } catch (err) {
-      console.error("Periodic resubscribe error:", err.message);
-    }
-  }, 10 * 60 * 1000);
+  setInterval(
+    async () => {
+      try {
+        log("♻️ Periodic resubscribe check...");
+        await resubscribeAll();
+      } catch (err) {
+        console.error("Periodic resubscribe error:", err.message);
+      }
+    },
+    10 * 60 * 1000,
+  );
 }
 
 start().catch((err) => {
