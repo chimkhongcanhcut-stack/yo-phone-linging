@@ -1025,7 +1025,7 @@ async function registerTelegramCommands() {
       { command: "listmin", description: "Xem ngưỡng USD theo wallet" },
       { command: "list", description: "Xem danh sách wallet" },
       { command: "status", description: "Xem trạng thái bot" },
-      { command: "testalert", description: "Gửi alert test + Bark notify" },
+      { command: "call", description: "Gửi alert test + Bark notify" },
       { command: "ping", description: "Kiểm tra bot còn sống" },
     ]);
     log("✅ Telegram command menu registered");
@@ -1051,7 +1051,7 @@ bot.start(async (ctx) => {
       "/listmin",
       "/list",
       "/status",
-      "/testalert",
+      "/call",
       "/ping",
     ].join("\n"),
   );
@@ -1264,7 +1264,7 @@ bot.command("list", async (ctx) => {
   );
 });
 
-bot.command("testalert", async (ctx) => {
+bot.command(["call", "testalert"], async (ctx) => {
   if (!requireAdmin(ctx)) return;
 
   const wallet =
